@@ -14,6 +14,14 @@ function expiredWhileWaiting() {
   return err;
 }
 
+// "s3.example.org" -> "https://s3.example.org". The field is prefilled with
+// "https://", so that alone counts as empty.
+export function normaliseEndpoint(value) {
+  const s = (value || "").trim().replace(/\/+$/, "");
+  if (!s || /^https?:\/*$/i.test(s)) return "";
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `https://${s}`;
+}
+
 export async function checkReachable(
   endpoint,
   bucket,
@@ -130,7 +138,9 @@ export function makeCredentialUploader({
       try {
         await put(`${keyBase}/_ACCESS_KEY_ID.txt`, new Blob([accessKeyId], { type: "text/plain" }), "text/plain");
       } catch (err) {
-        err.kind = "credentials";
+        // Only a refusal from the server means bad keys; anything else keeps its own cause
+        const status = err?.$metadata?.httpStatusCode;
+        if (status === 401 || status === 403) err.kind = "credentials";
         throw err;
       }
     },

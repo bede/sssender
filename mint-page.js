@@ -3,6 +3,7 @@
 // the same directory.
 import { mintMagicLink } from "./mint.js?v=20261026-111304";
 import { humanBytes, humanDate } from "./ui.js?v=20261026-111304";
+import { normaliseEndpoint } from "./uploaders.js?v=20261026-111304";
 
 const $ = (id) => document.getElementById(id);
 const isRaw = document.body.dataset.raw === "1";
@@ -17,7 +18,7 @@ async function mint() {
   const maxBytes = Math.floor(Number(val("max-gb")) * 1024 ** 3);
   try {
     const { link, prefix, expiresAt } = await mintMagicLink({
-      endpoint: val("server"),
+      endpoint: normaliseEndpoint($("server").value),
       bucket: val("bucket"),
       accessKeyId: val("access-key"),
       secretAccessKey: val("secret-key"),

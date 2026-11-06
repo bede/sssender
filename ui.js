@@ -2,7 +2,7 @@
 // magic-link banner, the upload-name field, run progress and error messages.
 import { SEQ_RE, pairSequenceFiles } from "./pairing.js?v=20261026-111304";
 import { describeExpiry } from "./link.js?v=20261026-111304";
-import { makeCredentialUploader } from "./uploaders.js?v=20261026-111304";
+import { makeCredentialUploader, normaliseEndpoint } from "./uploaders.js?v=20261026-111304";
 
 // --- Formatting --------------------------------------------------------------
 export function humanBytes(n) {
@@ -153,7 +153,7 @@ export function oversizeMessage(files, maxBytes, remedy) {
 export function bindCredentialForm({ server, bucket, accessKey, secretKey, onInput }) {
   const fields = [server, bucket, accessKey, secretKey];
   if (onInput) fields.forEach((el) => el.addEventListener("input", onInput));
-  const val = (el) => el.value.trim();
+  const val = (el) => (el === server ? normaliseEndpoint(el.value) : el.value.trim());
   return {
     filled: () => fields.every(val),
     bucket: () => val(bucket),
