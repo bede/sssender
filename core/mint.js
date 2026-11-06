@@ -1,10 +1,12 @@
 // Mint magic links in the browser: the same signed S3 POST policy as
 // scripts/mint-magic-link.py, so link.js reads either. The secret key is only used
-// to sign here; nothing is sent anywhere.
+// to sign here, and nothing is sent anywhere.
 
 export const POST_MAX_BYTES = 5 * 1024 ** 3; // S3 POST Object caps a single upload at 5 GB
 const MAX_DAYS = 7; // SigV4 signatures are invalid beyond 604800 s
-export const RAW_ROOT = "raw/"; // keeps unfiltered uploads out of paths assumed to be human-depleted
+// Per-app upload root, so apps sharing a bucket never clash
+export const DEFAULT_ROOT = "sssender/";
+const ROOT_RE = /^([a-z0-9][a-z0-9._-]*\/)+$/;
 const ALGORITHM = "AWS4-HMAC-SHA256";
 
 const enc = new TextEncoder();
@@ -13,6 +15,15 @@ const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart
 async function hmac(key, msg) {
   const k = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(msg)));
+}
+
+// SigV4 region: Amazon S3 refuses the wrong one, and its endpoints name theirs
+// (s3.eu-west-2.amazonaws.com). Other stores ignore it. Keep in step with the script
+export function regionForEndpoint(endpoint) {
+  const m = /^https?:\/\/(?:[^/]+\.)?s3[.-](?:dualstack\.)?([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?(?:[:/]|$)/i.exec(
+    endpoint || ""
+  );
+  return m && m[1] !== "external-1" ? m[1] : "us-east-1";
 }
 
 export async function signingKey(secret, datestamp, region, service) {
@@ -33,9 +44,17 @@ export function sanitise(name) {
   return slug;
 }
 
-// The letter-digit-letter-digit suffix avoids collisions, not guessing; the signature
-// is the secret
-export function makePrefix(name, { raw = false, randomFn = randomInt } = {}) {
+// Lower-case path segments, each ending in "/": "sssender/"
+export function checkRoot(root) {
+  if (!ROOT_RE.test(root || "")) {
+    throw new Error(`Invalid upload root ${JSON.stringify(root)}: expected e.g. "${DEFAULT_ROOT}".`);
+  }
+  return root;
+}
+
+// <root><name>-<suffix>/. The suffix only avoids collisions. The signature is the secret
+export function makePrefix(name, { root = DEFAULT_ROOT, randomFn = randomInt } = {}) {
+  checkRoot(root);
   const letters = "abcdefghijklmnopqrstuvwxyz";
   const digits = "0123456789";
   let suffix = "";
@@ -43,7 +62,7 @@ export function makePrefix(name, { raw = false, randomFn = randomInt } = {}) {
     const set = i % 2 === 0 ? letters : digits;
     suffix += set[randomFn(set.length)];
   }
-  return `${raw ? RAW_ROOT : ""}${sanitise(name)}-${suffix}/`;
+  return `${root}${sanitise(name)}-${suffix}/`;
 }
 
 function randomInt(n) {
@@ -62,11 +81,11 @@ function base64url(bytes) {
 export async function mintMagicLink({
   endpoint,
   bucket,
-  region = "us-east-1", // Ceph RGW ignores it, but it must match the signature
+  region = regionForEndpoint(endpoint), // must match the signature
   accessKeyId,
   secretAccessKey,
   name,
-  raw = false,
+  root = DEFAULT_ROOT,
   days = MAX_DAYS,
   maxBytes = POST_MAX_BYTES,
   baseUrl,
@@ -83,7 +102,7 @@ export async function mintMagicLink({
     const list = missing.length > 1 ? `${missing.slice(0, -1).join(", ")} and ${missing.at(-1)}` : missing[0];
     throw new Error(`Enter the ${list}.`);
   }
-  const prefix = makePrefix(name, { raw, ...(randomFn && { randomFn }) });
+  const prefix = makePrefix(name, { root, ...(randomFn && { randomFn }) });
   if (!(Number.isInteger(days) && days >= 1 && days <= MAX_DAYS)) {
     throw new Error(`Lifetime must be a whole number of days from 1 to ${MAX_DAYS}.`);
   }
@@ -108,7 +127,7 @@ export async function mintMagicLink({
   ];
   const fields = { "x-amz-algorithm": ALGORITHM, "x-amz-credential": credential, "x-amz-date": amzDate };
 
-  // These exact bytes are signed and posted; no canonical request for a POST policy
+  // These exact bytes are signed and posted. A POST policy has no canonical request
   const policy = JSON.stringify({ expiration: isoSeconds(expiresAt), conditions });
   fields.policy = btoa(policy);
   const key = await signingKey(secretAccessKey, datestamp, region, "s3");

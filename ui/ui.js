@@ -1,33 +1,11 @@
-// Shared page plumbing for apps built on seq2bucket: formatting, file selection, the
-// magic-link banner, the upload-name field, run progress and error messages.
-import { SEQ_RE, pairSequenceFiles } from "./pairing.js?v=20261026-111304";
-import { describeExpiry } from "./link.js?v=20261026-111304";
-import { makeCredentialUploader, normaliseEndpoint } from "./uploaders.js?v=20261026-111304";
+// Page plumbing for apps on sssender: formatting, file picking, credential form,
+// link banner, upload name and errors. Run progress is in run-view.js, type toggles in types.js
+import { describeExpiry } from "../core/link.js?v=20261026-111304";
+import { makeCredentialUploader, normaliseEndpoint } from "../core/uploaders.js?v=20261026-111304";
 
 // --- Formatting --------------------------------------------------------------
-export function humanBytes(n) {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) {
-    n /= 1024;
-    i++;
-  }
-  return `${n.toFixed(i === 0 ? 0 : 1)}${units[i]}`;
-}
-
-export function humanBases(bp) {
-  const units = ["bp", "kbp", "Mbp", "Gbp", "Tbp"];
-  let i = 0;
-  while (bp >= 1000 && i < units.length - 1) {
-    bp /= 1000;
-    i++;
-  }
-  return `${bp.toFixed(i === 0 ? 0 : 1)}${units[i]}`;
-}
-
-export function humanDate(ms) {
-  return new Date(ms).toISOString().replace("T", " ").replace(/:\d\d\.\d+Z$/, " UTC");
-}
+export { humanBytes, humanDate, plural } from "../core/format.js?v=20261026-111304";
+import { humanBytes, humanDate, plural } from "../core/format.js?v=20261026-111304";
 
 function timestampPrefix() {
   // Key-safe ISO 8601 (Zulu), no ms or colons
@@ -52,7 +30,7 @@ export function setButtonDisabled(btn, disabled) {
 }
 
 // --- File selection ----------------------------------------------------------
-// Click to pick, or drop files or directories; onFiles gets File[] with
+// Click to pick, or drop files or directories. onFiles gets File[] with
 // webkitRelativePath stamped on dropped entries, as the picker does
 export function bindFilePicker({ zone, input, isBusy, onFiles }) {
   zone.addEventListener("click", () => {
@@ -86,7 +64,7 @@ async function collectEntries(entries, prefix = "") {
           configurable: true,
         });
       } catch (_) {
-        // Read-only in some browsers; key falls back to basename
+        // Read-only in some browsers. The key then falls back to the basename
       }
       out.push(file);
     } else if (entry.isDirectory) {
@@ -98,7 +76,7 @@ async function collectEntries(entries, prefix = "") {
 }
 
 function readAllEntries(reader) {
-  // readEntries returns ~100 entries per call; loop until exhausted
+  // readEntries returns ~100 entries per call, so loop until exhausted
   return new Promise((resolve, reject) => {
     const all = [];
     const next = () =>
@@ -113,31 +91,21 @@ function readAllEntries(reader) {
   });
 }
 
-// Pair the sequence files in a selection. Never throws: a pairing error comes back
-// as `error`, with no groups.
-export function selectSequences(files) {
-  const seqs = files.filter((f) => SEQ_RE.test(f.name));
-  let groups;
-  try {
-    groups = pairSequenceFiles(seqs);
-  } catch (err) {
-    return { seqs, groups: [], totalBytes: 0, summary: "Pairing error", error: err?.message || String(err) };
+// One line for a selectFiles() result: "12 files selected (3.4GB total), …".
+// noun is "file" or "sequence file". details(sel) adds counts, e.g. ["2 pairs"]
+export function summariseSelection(sel, { noun = "file", details = () => [] } = {}) {
+  const skipped = [
+    sel.rejected ? `${plural(sel.rejected, "other file")} ignored` : "",
+    sel.ignored ? `${plural(sel.ignored, "hidden file")} skipped` : "",
+  ].filter(Boolean);
+  if (!sel.files.length) {
+    const none = sel.rejected || sel.ignored ? `No ${noun}s found in selection` : "";
+    return [none, ...skipped].filter(Boolean).join(", ");
   }
-  const totalBytes = groups.reduce((sum, g) => sum + g.size, 0);
-  let summary = "";
-  if (seqs.length === 0) {
-    summary = files.length ? "No fastq/fasta files found in selection" : "";
-  } else {
-    // Break down only when pairing grouped something; "6 files (6 files)" says nothing
-    const pairs = groups.filter((g) => g.kind === "paired").length;
-    const unpaired = groups.length - pairs;
-    const details = [`${humanBytes(totalBytes)} total`];
-    if (pairs) {
-      details.unshift(`${pairs} pair${pairs === 1 ? "" : "s"}`, ...(unpaired ? [`${unpaired} unpaired`] : []));
-    }
-    summary = `${seqs.length} sequence file${seqs.length === 1 ? "" : "s"} selected (${details.join(", ")})`;
-  }
-  return { seqs, groups, totalBytes, summary, error: null };
+  if (sel.error) return "Grouping error";
+  const total = `${humanBytes(sel.totalBytes)} total`;
+  const head = `${plural(sel.selected.length, noun)} selected (${[...details(sel), total].join(", ")})`;
+  return [head, ...skipped].join(", ");
 }
 
 export function oversizeMessage(files, maxBytes, remedy) {
@@ -170,31 +138,30 @@ export function bindCredentialForm({ server, bucket, accessKey, secretKey, onInp
 }
 
 // --- Busy indicator ----------------------------------------------------------
-// Animates the heading's .mascot, if the page has one, and puts the percentage in the
-// tab title while a run is going; stops at 100%.
-// finish() ends a successful run but leaves "100% · name" in the title until stop(),
-// so a background tab still shows it's done; stop() also restores the page title.
-export function makeBusyIndicator({ mascot, progress, name }) {
+// <html data-busy> while a run is going (pages animate as they like), and the
+// percentage in the tab title. finish() leaves "100% · title" until stop(), so a
+// background tab shows it's done. stop() restores the title.
+export function makeBusyIndicator({ progress }) {
   const pageTitle = document.title;
+  const root = document.documentElement;
   let timer = null;
   const halt = () => {
     clearInterval(timer);
     timer = null;
   };
+  const showPct = () => {
+    const pct = Math.min(Math.floor(progress.value || 0), 100);
+    document.title = `${pct}% · ${pageTitle}`;
+    return pct;
+  };
   return {
     start() {
       halt();
-      if (mascot) {
-        const [dna, , bucket] = mascot.children;
-        mascot.style.setProperty("--dna-travel", `${bucket.offsetLeft - dna.offsetLeft}px`);
-        mascot.classList.add("busy");
-      }
+      root.dataset.busy = "";
       progress.value = 0; // a previous run leaves it at 100
       const tick = () => {
-        const pct = Math.floor(progress.value || 0);
-        document.title = `${Math.min(pct, 100)}% · ${name}`;
-        if (pct >= 100) {
-          mascot?.classList.remove("busy");
+        if (showPct() >= 100) {
+          delete root.dataset.busy;
           halt();
         }
       };
@@ -203,21 +170,19 @@ export function makeBusyIndicator({ mascot, progress, name }) {
     },
     finish() {
       halt();
-      mascot?.classList.remove("busy");
-      if (document.title !== pageTitle) {
-        document.title = `${Math.min(Math.floor(progress.value || 0), 100)}% · ${name}`;
-      }
+      delete root.dataset.busy;
+      if (document.title !== pageTitle) showPct();
     },
     stop() {
       halt();
-      mascot?.classList.remove("busy");
+      delete root.dataset.busy;
       document.title = pageTitle;
     },
   };
 }
 
 // --- Confirmation dialog -----------------------------------------------------
-// A <dialog> holding <form method="dialog">; resolves true only for the button whose
+// A <dialog> holding <form method="dialog">. Resolves true only for the button whose
 // value is confirmValue. Cancel, Escape and any other close resolve false.
 export function confirmDialog(dialog, confirmValue = "upload") {
   return new Promise((resolve) => {
@@ -228,7 +193,7 @@ export function confirmDialog(dialog, confirmValue = "upload") {
 }
 
 // --- Magic-link banner -------------------------------------------------------
-// Returns whether the link has expired; call again to tick the countdown
+// Returns whether the link has expired. Call again to tick the countdown
 export function renderLinkBanner(el, link) {
   const { expired, text } = describeExpiry(link.expiresAt);
   el.classList.toggle("expired", expired);
@@ -258,7 +223,7 @@ export function renderLinkError(el, message) {
 }
 
 // --- Upload name -------------------------------------------------------------
-// A greyed, ticking "<timestamp>--" prefix; the real value is captured at upload
+// A greyed, ticking "<timestamp>--" prefix. The real value is captured at upload
 // start and frozen, so the field matches what's uploaded
 export function bindUploadName({ prefixEl, inputEl }) {
   let frozen = null;
@@ -286,121 +251,6 @@ export function bindUploadName({ prefixEl, inputEl }) {
   };
 }
 
-// --- Run progress ------------------------------------------------------------
-export function renderFileList(listEl, groups) {
-  listEl.innerHTML = "";
-  const rows = groups.map((group) => {
-    const li = document.createElement("li");
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = group.label;
-    const st = document.createElement("span");
-    st.className = "st";
-    li.append(name, st);
-    listEl.appendChild(li);
-    return { li, st };
-  });
-  listEl.style.display = rows.length ? "" : "none";
-  return rows;
-}
-
-// Drives the progress bar, label and per-group rows from runUpload's hooks.
-//   filtering: a transform reports progress before (or while) uploading
-//   streaming: filtered output streams straight into the upload (credential mode)
-export function makeRunView({
-  wrap,
-  bar,
-  label,
-  rows,
-  groups,
-  filtering = false,
-  streaming = false,
-  doneText = () => "done",
-}) {
-  const totalBytes = groups.reduce((n, g) => n + g.size, 0);
-  const count = groups.length;
-  let before = 0; // input bytes of finished groups
-  let cur = null;
-
-  const overall = (bytes) => {
-    const pct = totalBytes ? ((before + bytes) / totalBytes) * 100 : 0;
-    bar.value = pct;
-    return pct;
-  };
-  const renderRow = (i) => {
-    const st = rows[i].st;
-    if (cur.uploading) {
-      const pct = cur.uploadTotal ? Math.min(100, (cur.uploaded / cur.uploadTotal) * 100) : 100;
-      st.textContent = `uploading ${pct.toFixed(0)}%`;
-      return;
-    }
-    if (!filtering) return;
-    const size = groups[i].size;
-    const pct = size ? Math.min(100, (cur.processed / size) * 100) : 100;
-    st.textContent = streaming
-      ? `filtered ${pct.toFixed(0)}%, uploaded ${humanBytes(cur.uploaded)}`
-      : `filtering ${pct.toFixed(0)}%`;
-  };
-
-  wrap.style.display = "block";
-  bar.value = 0;
-  label.textContent = "";
-  rows.forEach(({ li, st }) => {
-    li.className = "";
-    st.textContent = "queued";
-  });
-
-  return {
-    onGroupStart(i) {
-      cur = { processed: 0, uploaded: 0, uploadTotal: 0, uploading: false };
-      rows[i].li.className = "active";
-      rows[i].st.textContent = filtering ? "filtering…" : "uploading…";
-    },
-    onTransformProgress(i, msg) {
-      cur.processed = msg.bytesProcessed || 0;
-      const pct = overall(cur.processed);
-      label.textContent =
-        `Filtering ${i + 1} of ${count}: ` +
-        `${humanBytes(before + cur.processed)} / ${humanBytes(totalBytes)} (${pct.toFixed(1)}%)`;
-      renderRow(i);
-    },
-    // Not called when a stream feeds a multipart upload directly
-    onUploadStart(i, bytes) {
-      cur.uploading = true;
-      cur.uploadTotal = bytes;
-      renderRow(i);
-    },
-    onUploadProgress(i, bytes) {
-      cur.uploaded = bytes;
-      if (!filtering) {
-        // Nothing else moves the overall bar
-        const pct = overall(bytes);
-        label.textContent =
-          `Uploading ${i + 1} of ${count}: ` +
-          `${humanBytes(before + bytes)} / ${humanBytes(totalBytes)} (${pct.toFixed(1)}%)`;
-      } else if (cur.uploading) {
-        label.textContent =
-          `Uploading ${i + 1} of ${count}: ${humanBytes(bytes)} / ${humanBytes(cur.uploadTotal)}`;
-      }
-      renderRow(i);
-    },
-    onGroupDone(i, item, result) {
-      before += groups[i].size;
-      rows[i].li.className = "done";
-      rows[i].st.textContent = doneText(item, result);
-    },
-    fail(i) {
-      if (!rows[i]) return;
-      rows[i].li.className = "failed";
-      rows[i].st.textContent = "failed";
-    },
-    finish(text) {
-      bar.value = 100;
-      label.textContent = text;
-    },
-  };
-}
-
 // --- Errors ------------------------------------------------------------------
 // err.kind is set where the cause is known for certain (preflight, link, storage…)
 export function formatError(err) {
@@ -414,15 +264,12 @@ export function formatError(err) {
       return msg;
     case "link":
       return `${msg}\nThis magic link is no longer valid. Ask whoever sent it for a new one.`;
-    case "cors":
-      return (
-        "Connection failed. Couldn't reach the object store from this page. The " +
-        "bucket must allow PUT/POST from this origin and expose the ETag header."
-      );
+    case "unreachable": // the message says what to check, and who can
+      return msg;
     case "network":
       return `${msg} Check your internet connection and try again.`;
   }
-  // fetch() throws TypeError on network/CORS failures; message varies by browser
+  // fetch() throws TypeError on network/CORS failures, worded differently by each browser
   if (name === "TypeError" || /CORS|Failed to fetch|NetworkError|Load failed/i.test(msg)) {
     return (
       `${msg}. Check bucket CORS policy. The bucket must allow ` +

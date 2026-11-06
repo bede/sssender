@@ -1,10 +1,8 @@
 // Magic-link transport: POST Object with retry, and idle (never total-duration)
 // timeouts. A POST is single-shot: no multipart, 5 GB per object, body sent in one
 // request, and a retry re-sends from byte 0.
-import { describeExpiry } from "./link.js?v=20261026-111304";
-
-const RETRY_BASE_MS = 1000;
-const RETRY_MAX_MS = 60 * 1000;
+import { linkExpiredError } from "./link.js?v=20261026-111304";
+import { retryUntilDone } from "./retry.js?v=20261026-111304";
 
 // Idle timeouts, never total-duration ones: a multi-GB POST over a bad link runs for
 // hours, and a retry re-sends from byte 0, so a false positive costs the whole object.
@@ -69,9 +67,11 @@ async function postObjectFetch({
   key,
   body,
   contentType = "application/octet-stream",
+  signal,
   setTimerFn = setTimeout,
   clearTimerFn = clearTimeout,
 }) {
+  signal?.throwIfAborted();
   let resp;
   let errorBody = "";
   let offlineErr = null;
@@ -91,6 +91,8 @@ async function postObjectFetch({
       ctrl.abort();
     }, SMALL_MS);
   }
+  const onAbort = () => ctrl?.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     resp = await fetch(`${link.endpoint}/${link.bucket}`, {
       method: "POST",
@@ -103,32 +105,41 @@ async function postObjectFetch({
     // while an error body is consumed, or a half-delivered XML error can hang.
     if (!resp.ok) errorBody = await resp.text();
   } catch (_) {
-    // Whichever cause triggered the abort wins; offline is the more specific
+    // Whichever cause triggered the abort wins, offline being the more specific
+    if (signal?.aborted) throw signal.reason;
     throw offlineErr || timeoutErr || uploadTransportError();
   } finally {
     if (timer !== null) clearTimerFn(timer);
     removeOffline();
+    signal?.removeEventListener("abort", onAbort);
   }
   if (resp.ok) return;
   throw s3ErrorFromText(resp.status, resp.statusText, errorBody);
 }
 
-// XHR is only for progress; it forces preflight.
+// XHR is only for progress. It forces a CORS preflight.
 function postObjectXhr({
   link,
   key,
   body,
   contentType = "application/octet-stream",
   onProgress,
+  signal,
   setTimerFn = setTimeout,
   clearTimerFn = clearTimeout,
 }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
     const xhr = new XMLHttpRequest();
     let settled = false;
     let offlineErr = null;
     let timeoutErr = null;
     let removeOffline = () => {};
+    // Caller gave up (a sibling failed): abort with its reason, no retry
+    const onAbort = () => abortWith(signal.reason);
     let stallTimer = null;
     let responseTimer = null;
     let uploadComplete = false;
@@ -145,6 +156,7 @@ function postObjectXhr({
       settled = true;
       clearTimers();
       removeOffline();
+      signal?.removeEventListener("abort", onAbort);
       fn(value);
     };
     // abort() fires onabort synchronously, so stash the cause first, as offline does
@@ -193,6 +205,7 @@ function postObjectXhr({
     xhr.ontimeout = () => finish(reject, uploadTransportError("Upload timed out."));
     xhr.onabort = () =>
       finish(reject, offlineErr || timeoutErr || uploadTransportError("Upload was interrupted."));
+    signal?.addEventListener("abort", onAbort, { once: true });
     armStall();
     xhr.send(postForm({ link, key, body, contentType }));
   });
@@ -203,94 +216,50 @@ export function postObject(args) {
   return postObjectXhr(args);
 }
 
-export function retryDelayMs(attempt, { baseMs = RETRY_BASE_MS, maxMs = RETRY_MAX_MS } = {}) {
-  return Math.min(maxMs, baseMs * 2 ** Math.max(0, attempt - 1));
-}
-
 export function isRetryableUploadError(err) {
   if (!err) return false;
   if (err.kind === "network") return true;
-  if (err.kind === "link" || err.kind === "size" || err.kind === "cors") {
+  if (err.kind === "link" || err.kind === "size" || err.kind === "unreachable") {
     return false;
   }
   return err.status === 408 || err.status === 429 || (err.status >= 500 && err.status < 600);
 }
 
-export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-export function waitForOnline() {
-  if (typeof navigator === "undefined" || navigator.onLine !== false) return Promise.resolve();
-  if (typeof window === "undefined" || typeof window.addEventListener !== "function") return sleep(RETRY_MAX_MS);
-  return new Promise((resolve) => window.addEventListener("online", resolve, { once: true }));
-}
-
-function linkExpiredError(link, now = Date.now()) {
-  const { expired, text } = describeExpiry(link.expiresAt, now);
-  if (!expired) return null;
-  const err = new Error(`This magic link expired ${text} ago.`);
-  err.kind = "link";
-  return err;
-}
-
-async function waitWhileOffline({ attempt, link, onRetry, sleepFn, waitOnlineFn, nowFn }) {
-  let waited = false;
-  while (typeof navigator !== "undefined" && navigator.onLine === false) {
-    waited = true;
-    const waitMs = Math.min(RETRY_MAX_MS, Math.max(0, link.expiresAt - nowFn()));
-    onRetry?.({ attempt, waitingOnline: true, waitMs });
-    await Promise.race([waitOnlineFn(), sleepFn(waitMs)]);
-    const expired = linkExpiredError(link, nowFn());
-    if (expired) throw expired;
+// A file moved, changed or deleted since it was picked fails like a dropped
+// connection and would retry forever. Reading one byte tells them apart
+export async function checkReadable(body) {
+  if (typeof Blob === "undefined" || !(body instanceof Blob)) return;
+  try {
+    await body.slice(0, 1).arrayBuffer();
+  } catch (cause) {
+    const err = new Error("The file can no longer be read: it was moved, changed or deleted after it was selected.", {
+      cause,
+    });
+    err.kind = "input";
+    throw err;
   }
-  return waited;
 }
 
-export async function postObjectWithRetry({
+// Retry a POST until it lands, the link expires or `signal` aborts. The body must
+// still be readable before each retry
+export function postObjectWithRetry({
   onRetry,
-  sleepFn = sleep,
-  waitOnlineFn = waitForOnline,
+  sleepFn,
+  waitOnlineFn,
   nowFn = Date.now,
   postOnce = postObject,
+  checkReadableFn = checkReadable,
   ...args
 }) {
-  let attempt = 0;
-  for (;;) {
-    const expired = linkExpiredError(args.link, nowFn());
-    if (expired) throw expired;
-    if (await waitWhileOffline({
-      attempt,
-      link: args.link,
-      onRetry,
-      sleepFn,
-      waitOnlineFn,
-      nowFn,
-    })) {
-      onRetry?.({ attempt, resumed: true });
-    }
-
-    try {
-      return await postOnce(args);
-    } catch (err) {
-      if (!isRetryableUploadError(err)) throw err;
-
-      attempt++;
-      if (typeof navigator !== "undefined" && navigator.onLine === false) {
-        if (await waitWhileOffline({
-          attempt,
-          link: args.link,
-          onRetry: (info) => onRetry?.({ ...info, error: err }),
-          sleepFn,
-          waitOnlineFn,
-          nowFn,
-        })) {
-          onRetry?.({ attempt, resumed: true, error: err });
-        }
-        continue;
-      }
-
-      const waitMs = Math.min(retryDelayMs(attempt), Math.max(0, args.link.expiresAt - nowFn()));
-      onRetry?.({ attempt, waitMs, error: err });
-      await sleepFn(waitMs);
-    }
-  }
+  return retryUntilDone(() => postOnce(args), {
+    retryable: isRetryableUploadError,
+    signal: args.signal,
+    deadline: args.link.expiresAt,
+    expired: () => linkExpiredError(args.link.expiresAt, nowFn()),
+    beforeRetry: () => checkReadableFn(args.body),
+    onRetry,
+    nowFn,
+    ...(sleepFn && { sleepFn }),
+    ...(waitOnlineFn && { waitOnlineFn }),
+  });
 }

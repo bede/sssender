@@ -1,12 +1,11 @@
-// Companion page for minting magic links in the browser, shared by updeacon-s3 and
-// seq2bucket. <body data-raw="1"> puts uploads under raw/. The link opens the app in
-// the same directory.
-import { mintMagicLink } from "./mint.js?v=20261026-111304";
+// Mint page for any app on sssender. <body data-root="app/"> names the app's upload
+// root (required). The link opens the app in this directory
+import { checkRoot, mintMagicLink } from "../core/mint.js?v=20261026-111304";
+import { normaliseEndpoint } from "../core/uploaders.js?v=20261026-111304";
 import { humanBytes, humanDate } from "./ui.js?v=20261026-111304";
-import { normaliseEndpoint } from "./uploaders.js?v=20261026-111304";
 
 const $ = (id) => document.getElementById(id);
-const isRaw = document.body.dataset.raw === "1";
+const root = checkRoot(document.body.dataset.root);
 const val = (id) => $(id).value.trim();
 const setError = (msg = "") => ($("mint-error").textContent = msg);
 
@@ -23,7 +22,7 @@ async function mint() {
       accessKeyId: val("access-key"),
       secretAccessKey: val("secret-key"),
       name: val("link-name"),
-      raw: isRaw,
+      root,
       days: Number(val("days")),
       maxBytes,
       baseUrl: new URL("./", location.href).href,

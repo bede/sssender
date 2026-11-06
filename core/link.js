@@ -36,7 +36,7 @@ function readPolicy(encoded) {
   }
 
   if (!bucket) throw new Error("Magic link names no bucket.");
-  // Object store enforces the prefix; this only refuses an unscoped link
+  // The store enforces the prefix. This only refuses an unscoped link
   if (prefix == null) throw new Error("Magic link does not restrict uploads to a prefix.");
   const expiresAt = Date.parse(policy.expiration);
   if (Number.isNaN(expiresAt)) throw new Error("Magic link has no valid expiry.");
@@ -53,7 +53,7 @@ export function parseMagicLink(hash) {
   try {
     payload = jsonFromBase64(raw);
   } catch (_) {
-    throw new Error("Magic link is corrupt — it may have been truncated in transit.");
+    throw new Error("Magic link is corrupt. It may have been truncated in transit.");
   }
   if (payload.v !== 1) {
     throw new Error(`Magic link version ${payload.v} is not supported by this page.`);
@@ -90,4 +90,21 @@ export function describeExpiry(expiresAt, now = Date.now()) {
     break;
   }
   return { expired: ms <= 0, text };
+}
+
+export function linkExpiredError(expiresAt, now = Date.now()) {
+  const err = new Error(`This magic link expired ${describeExpiry(expiresAt, now).text} ago.`);
+  err.kind = "link";
+  return err;
+}
+
+// For _CLIENT.json: the signing key's ID (not secret), prefix and expiry
+export function linkAccess(link) {
+  const credential = link.fields?.["x-amz-credential"] || "";
+  return {
+    mode: "link",
+    access_key_id: credential.split("/")[0] || null,
+    prefix: link.prefix,
+    expires: new Date(link.expiresAt).toISOString(),
+  };
 }
