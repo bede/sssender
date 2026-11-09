@@ -62,6 +62,7 @@ const linkExpired = showMode({
 });
 
 const selection = bindSelection({
+  dropAnywhere: true,
   isBusy: () => isBusy,
   onChange(sel) {
     busyIndicator.stop(); // a new selection or Reset clears a finished run's title

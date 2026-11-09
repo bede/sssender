@@ -54,8 +54,14 @@ export function showMode({ link, linkError, app, version, commit, bucket, onTick
 
 // --- Selection -----------------------------------------------------------------
 // Drop zone over selectFiles(): dropped files, switched-off types, summary, toggles.
-// onChange(selection) after each change
-export function bindSelection({ options = {}, summarise = (sel) => summariseSelection(sel), isBusy, onChange }) {
+// onChange(selection) after each change. dropAnywhere: as bindFilePicker's anywhere
+export function bindSelection({
+  options = {},
+  summarise = (sel) => summariseSelection(sel),
+  isBusy,
+  onChange,
+  dropAnywhere = false,
+}) {
   const zone = $("dir-zone");
   const input = $("dir-input");
   let dropped = [];
@@ -83,7 +89,7 @@ export function bindSelection({ options = {}, summarise = (sel) => summariseSele
     refresh();
   }
 
-  bindFilePicker({ zone, input, isBusy, onFiles: set });
+  bindFilePicker({ zone, input, isBusy, onFiles: set, anywhere: dropAnywhere });
   return {
     current: () => selection,
     render, // e.g. to disable the toggles while busy

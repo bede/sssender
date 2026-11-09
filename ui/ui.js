@@ -31,12 +31,17 @@ export function setButtonDisabled(btn, disabled) {
 
 // --- File selection ----------------------------------------------------------
 // Click to pick, or drop files or directories. onFiles gets File[] with
-// webkitRelativePath stamped on dropped entries, as the picker does
-export function bindFilePicker({ zone, input, isBusy, onFiles }) {
+// webkitRelativePath stamped on dropped entries, as the picker does.
+// anywhere: the whole window takes the drop, for pages with nothing else to drop on
+export function bindFilePicker({ zone, input, isBusy, onFiles, anywhere = false }) {
   zone.addEventListener("click", () => {
     if (!isBusy()) input.click();
   });
   input.addEventListener("change", () => onFiles(Array.from(input.files)));
+  if (anywhere) {
+    bindPageDrop({ zone, isBusy, onFiles });
+    return;
+  }
   zone.addEventListener("dragover", (e) => {
     e.preventDefault();
     if (!isBusy()) zone.classList.add("dragover");
@@ -46,12 +51,62 @@ export function bindFilePicker({ zone, input, isBusy, onFiles }) {
     e.preventDefault();
     zone.classList.remove("dragover");
     if (isBusy()) return;
-    const entries = Array.from(e.dataTransfer.items)
-      .map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null))
-      .filter(Boolean);
-    onFiles(entries.length ? await collectEntries(entries) : Array.from(e.dataTransfer.files || []));
+    onFiles(await droppedFiles(e.dataTransfer));
   });
 }
+
+// Dragged files raise a full-window overlay whose label ignores the pointer, so its
+// dragleave means the drag left the window. Drops are refused while busy or a modal
+// is open, and never fall through to the browser opening the file.
+function bindPageDrop({ zone, isBusy, onFiles }) {
+  const overlay = document.createElement("div");
+  overlay.className = "page-drop";
+  overlay.hidden = true;
+  const label = document.createElement("div");
+  label.className = "page-drop-label";
+  label.textContent = "Drop files or a directory to select them";
+  overlay.append(label);
+  document.body.append(overlay);
+  const blocked = () => isBusy() || !!document.querySelector(":modal");
+  const show = (on) => {
+    overlay.hidden = !on;
+    zone.classList.toggle("dragover", on);
+  };
+
+  addEventListener("dragenter", (e) => {
+    if (carriesFiles(e) && !blocked()) show(true);
+  });
+  // Outside the overlay, whose handlers stop propagation
+  addEventListener("dragover", (e) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "none";
+  });
+  addEventListener("drop", (e) => {
+    if (carriesFiles(e)) e.preventDefault();
+  });
+  overlay.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "copy";
+  });
+  overlay.addEventListener("dragleave", () => show(false));
+  overlay.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    show(false);
+    if (!blocked()) onFiles(await droppedFiles(e.dataTransfer));
+  });
+}
+
+async function droppedFiles(dataTransfer) {
+  const entries = Array.from(dataTransfer.items)
+    .map((it) => (it.webkitGetAsEntry ? it.webkitGetAsEntry() : null))
+    .filter(Boolean);
+  return entries.length ? await collectEntries(entries) : Array.from(dataTransfer.files || []);
+}
+
+const carriesFiles = (e) => Array.from(e.dataTransfer?.types || []).includes("Files");
 
 async function collectEntries(entries, prefix = "") {
   const out = [];
