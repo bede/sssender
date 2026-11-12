@@ -24,7 +24,7 @@ import {
 
 const APP = "sssender";
 const ROOT = DEFAULT_ROOT; // credential uploads. A link's prefix is fixed by its policy
-const CONCURRENCY = 4; // files in flight at once. The credential uploader caps itself lower
+const CONCURRENCY = 2; // files in flight at once
 
 const { link: LINK, linkError } = readMagicLink();
 

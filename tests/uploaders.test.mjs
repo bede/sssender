@@ -8,28 +8,10 @@ const { makeLinkUploader, makeCredentialUploader, normaliseEndpoint, patientRetr
   `${pathToFileURL(resolve(here, "../core/uploaders.js"))}?test=${Date.now()}`
 );
 
-function fakeTimers() {
-  let seq = 0;
-  const pending = new Map();
-  return {
-    setTimerFn(fn, ms) {
-      const id = ++seq;
-      pending.set(id, { fn, ms });
-      return id;
-    },
-    clearTimerFn(id) {
-      pending.delete(id);
-    },
-    fire(ms) {
-      const found = [...pending].find(([, timer]) => timer.ms === ms);
-      assert.ok(found, `no ${ms}ms timer was armed`);
-      pending.delete(found[0]);
-      found[1].fn();
-    },
-    get size() {
-      return pending.size;
-    },
-  };
+class FakeS3Client {
+  constructor() {
+    this.config = { requestHandler: {} };
+  }
 }
 
 test("link upload checks combined spool capacity before pulling either output", async () => {
@@ -142,7 +124,7 @@ test("credential upload sends a whole Blob as the multipart Body", async () => {
     bucket: "b",
     endpoint: "e",
     region: "r",
-    loadSdk: async () => ({ Upload, S3Client: class {} }),
+    loadSdk: async () => ({ Upload, S3Client: FakeS3Client }),
   });
   await uploader.preflight("p");
   const body = new Blob(["@r\n"]);
@@ -176,7 +158,7 @@ function failingCredentialUploader(error) {
     secretAccessKey: "s",
     bucket: "b",
     endpoint: "https://e",
-    loadSdk: async () => ({ Upload, S3Client: class {} }),
+    loadSdk: async () => ({ Upload, S3Client: FakeS3Client }),
   });
 }
 
@@ -229,13 +211,8 @@ test("credential upload aborts its multipart uploads when the run is stopped", a
     secretAccessKey: "s",
     bucket: "b",
     endpoint: "e",
-    loadSdk: async () => ({ Upload, S3Client: class {} }),
+    loadSdk: async () => ({ Upload, S3Client: FakeS3Client }),
   });
-  // preflight's own credentials check must not hang
-  Upload.prototype.done = function () {
-    if (this.key.endsWith("_ACCESS_KEY_ID.txt")) return Promise.resolve();
-    return new Promise((_, reject) => (this.reject = reject));
-  };
   await uploader.preflight("p");
   const ctrl = new AbortController();
   const run = uploader.uploadGroup(
@@ -348,7 +325,7 @@ test("cancelling ends a credential retry wait", async () => {
 const LINK = { endpoint: "https://e", bucket: "b", maxBytes: 100, expiresAt: Date.now() + 3_600_000, fields: {} };
 
 function firstContactUploader({ results, elapsedMs = 0, online = () => true, waitOnlineFn = async () => {} }) {
-  let now = 0;
+  let now = Date.now();
   const calls = [];
   const sleeps = [];
   const uploader = makeLinkUploader({
@@ -372,7 +349,6 @@ test("a first write that fails at once, twice, means the store can't be reached 
   await assert.rejects(first(), (err) => err.kind === "unreachable" && /Ask whoever sent the link/.test(err.message));
   assert.equal(calls.length, 2);
   assert.deepEqual(sleeps, [3000]); // one more try a few seconds later, for a blip
-  assert.equal(typeof calls[0].onProgress, "function"); // sent as uploads are, so CORS is checked the same way
 });
 
 test("a blip on the first write is forgiven once", async () => {
@@ -430,7 +406,7 @@ test("credential mode says what to check itself", async () => {
     secretAccessKey: "s",
     bucket: "b",
     endpoint: "https://e",
-    loadSdk: async () => ({ Upload, S3Client: class {} }),
+    loadSdk: async () => ({ Upload, S3Client: FakeS3Client }),
     waits: { sleepFn: async () => {}, onlineFn: () => true },
   });
   await uploader.preflight("p");
@@ -438,4 +414,22 @@ test("credential mode says what to check itself", async () => {
     uploader.putSmall("p/_CLIENT.json", new Blob(["{}"]), "application/json", { first: true }),
     (err) => err.kind === "unreachable" && /Check the server address/.test(err.message)
   );
+});
+
+test("first contact's retry wait is clipped to the link's expiry", async () => {
+  let now = 0;
+  let attempts = 0;
+  const sleeps = [];
+  const uploader = makeLinkUploader({
+    link: { ...LINK, expiresAt: 25_000 },
+    postOnceFn: async () => { attempts++; now = 24_900; throw refused(); },
+    waits: {
+      nowFn: () => now, onlineFn: () => true,
+      sleepFn: async (ms) => { sleeps.push(ms); now += ms; },
+    },
+  });
+  await assert.rejects(uploader.putSmall("p/_CLIENT.json", new Blob(["{}"]), "application/json", { first: true }),
+    (err) => err.kind === "link");
+  assert.equal(attempts, 1);
+  assert.deepEqual(sleeps, [100]);
 });

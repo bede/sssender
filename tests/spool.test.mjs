@@ -36,6 +36,21 @@ test("small outputs retain the compatibility memory fallback", async () => {
   assert.equal(await blob.text(), "reads");
 });
 
+test("Cancel also stops a pending read in the memory spool fallback", { timeout: 1000 }, async () => {
+  const ctrl = new AbortController();
+  let cancelled;
+  const stream = new ReadableStream({
+    pull: () => new Promise(() => {}),
+    cancel(reason) { cancelled = reason; },
+  });
+  const spooling = spoolToFile(stream, "small.bin", { expectedBytes: 5, signal: ctrl.signal });
+  const reason = new DOMException("Cancelled", "AbortError");
+  ctrl.abort(reason);
+  await assert.rejects(spooling, (err) => err === reason);
+  assert.equal(cancelled, reason);
+  assert.ok(!stream.locked);
+});
+
 test("spool preparation requests persistence without guessing the filtered size", async () => {
   let persistCalls = 0;
   const result = await prepareSpoolStorage(80, {

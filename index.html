@@ -32,13 +32,13 @@
 <div class="section-head unnumbered">Usage</div>
 <div class="usage">
   <ol id="usage-link" hidden>
-    <li>Drag &amp; drop the files you wish to upload, or a directory containing them.</li>
-    <li>Choose a name and press 'Upload'.</li>
+    <li>Drag &amp; drop the files or directory you wish to upload</li>
+    <li>Choose a name and press 'Upload'</li>
   </ol>
   <ol id="usage-creds">
-    <li>Enter S3-compatible object storage credentials.</li>
-    <li>Drag &amp; drop the files you wish to upload, or a directory containing them.</li>
-    <li>Choose a name and press 'Upload'.</li>
+    <li>Enter S3-compatible object storage credentials</li>
+    <li>Drag &amp; drop the files or directory you wish to upload</li>
+    <li>Choose a name and press 'Upload'</li>
   </ol>
 </div>
 
@@ -108,6 +108,20 @@
     <div class="actions">
       <button value="upload" id="confirm-upload">Upload</button>
       <button value="cancel" class="secondary" autofocus>Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="done-dialog" aria-labelledby="done-title">
+  <form method="dialog">
+    <h2 id="done-title"></h2>
+    <p><span id="done-count"></span> uploaded to <span id="done-dest" class="mono"></span></p>
+    <div id="done-skipped" hidden>
+      <p><span id="done-skipped-count"></span> skipped, and listed in <span class="mono">_FAILED.txt</span>:</p>
+      <ul class="skipped" id="done-skipped-list"></ul>
+    </div>
+    <div class="actions">
+      <button value="ok" autofocus>OK</button>
     </div>
   </form>
 </dialog>

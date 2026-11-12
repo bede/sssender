@@ -32,6 +32,7 @@ function fakeUploader({ failOn, failKind, concurrency, gate } = {}) {
       calls.push(["start", item.keys]);
       if (gate) await gate(item, hooks);
       if (failOn === item.keys[0]) throw Object.assign(new Error("boom"), failKind && { kind: failKind });
+      await Promise.all(outputs.filter((o) => o.stream).map((o) => new Response(o.stream).arrayBuffer()));
       hooks.onUploadStart(item.size);
       hooks.onUploadProgress(item.size);
       calls.push(["group", item.keys, outputs]);
@@ -48,7 +49,7 @@ test("runUpload follows the protocol: preflight, groups, extras, manifest last",
   const transform = {
     name: "t",
     outputName: (p) => p + ".out",
-    start: (g) => g.files.map(() => ({ stream: "s" })),
+    start: (g) => g.files.map(() => ({ stream: new Blob(["out"]).stream() })),
     extras: (item) => [{ key: `${item.keys[0]}.json`, body: new Blob(["{}"]), contentType: "application/json" }],
   };
   const { keys } = await runUpload({
@@ -164,7 +165,7 @@ test("runUpload reports progress per group through its hooks", async () => {
       start: (_g, hooks) => {
         hooks.onProgress({ bytesProcessed: 3 });
         hooks.onStats({ readsIn: 1 }, "0.5");
-        return [{ stream: "s" }];
+        return [{ stream: new Blob(["out"]).stream() }];
       },
     },
     hooks: {
@@ -393,4 +394,123 @@ test("a refused _CLIENT.json stops the run before any data is sent", async () =>
     (err) => err.kind === "credentials"
   );
   assert.ok(!uploader.calls.some((c) => c[0] === "start"));
+});
+
+test("Cancel reaches the _FAILED.txt and _MANIFEST.txt writes too", async () => {
+  const uploader = fakeUploader({ failOn: "p/run/b.fastq" });
+  const signals = {};
+  uploader.putSmall = async (key, _body, _type, opts = {}) => {
+    signals[key.split("/").pop()] = opts.signal;
+  };
+  const ctrl = new AbortController();
+  await runUpload({
+    groups: [group(file("a.fastq")), group(file("b.fastq"))],
+    keyBase: "p/run",
+    uploader,
+    transform: rawTransform,
+    signal: ctrl.signal,
+  });
+  assert.equal(signals["_FAILED.txt"], ctrl.signal);
+  assert.equal(signals["_MANIFEST.txt"], ctrl.signal);
+});
+
+test("Cancel stops both pending transform streams and waits for their cleanup", { timeout: 1000 }, async () => {
+  const ctrl = new AbortController();
+  const cancelled = [];
+  const sources = [];
+  let reading;
+  const ready = new Promise((resolve) => { reading = resolve; });
+  const uploader = fakeUploader();
+  uploader.uploadGroup = async (item, outputs) => {
+    const reads = outputs.map((o) => new Response(o.stream).arrayBuffer());
+    reading();
+    await Promise.all(reads);
+    return item.keys;
+  };
+  const run = runUpload({
+    groups: [group(file("r1.fq"), file("r2.fq"))], keyBase: "p", uploader, signal: ctrl.signal,
+    transform: {
+      ...rawTransform,
+      start: (item) => item.files.map((_, i) => {
+        const stream = new ReadableStream({
+          pull: () => new Promise(() => {}),
+          async cancel(reason) {
+            await tick();
+            cancelled.push([i, reason]);
+          },
+        });
+        sources.push(stream);
+        return { stream };
+      }),
+    },
+  });
+  await ready;
+  const reason = new DOMException("Cancelled", "AbortError");
+  ctrl.abort(reason);
+  await assert.rejects(run, (err) => err === reason);
+  assert.deepEqual(cancelled.map(([i]) => i).sort(), [0, 1]);
+  assert.ok(cancelled.every(([, err]) => err === reason));
+  assert.ok(sources.every((source) => !source.locked));
+  assert.ok(!uploader.calls.some((c) => c[1] === "p/_MANIFEST.txt"));
+});
+
+test("a fresh transform attempt waits for the failed attempt's producer cleanup", { timeout: 1000 }, async () => {
+  let attempt = 0;
+  let cleaned = false;
+  const uploader = fakeUploader();
+  uploader.uploadGroup = async (item, outputs) => {
+    if (attempt === 1) throw Object.assign(new Error("worker crashed"), { kind: "input", retry: true });
+    await Promise.all(outputs.map((o) => new Response(o.stream).arrayBuffer()));
+    return item.keys;
+  };
+  const { failed } = await runUpload({
+    groups: [group(file("a.fq"))], keyBase: "p", uploader,
+    transform: {
+      ...rawTransform,
+      start() {
+        attempt++;
+        if (attempt === 2) assert.ok(cleaned, "old worker callbacks must be cleared before restarting");
+        return [{ stream: new ReadableStream({
+          start(controller) { if (attempt === 2) controller.close(); },
+          async cancel() { await tick(); cleaned = true; },
+        }) }];
+      },
+    },
+  });
+  assert.equal(attempt, 2);
+  assert.deepEqual(failed, []);
+});
+
+test("a fatal error stops sibling groups before slow producer cleanup finishes", { timeout: 1000 }, async (t) => {
+  let finishCleanup;
+  const cleanup = new Promise((resolve) => { finishCleanup = resolve; });
+  t.after(() => finishCleanup());
+  let fail;
+  const started = [];
+  const signals = [];
+  const uploader = fakeUploader();
+  uploader.uploadGroup = async (item, outputs, { signal }) => {
+    started.push(item.keys[0]);
+    signals.push(signal);
+    if (started.length === 1) await new Promise((_, reject) => { fail = reject; });
+    else await new Response(outputs[0].stream).arrayBuffer();
+    return item.keys;
+  };
+  const run = runUpload({
+    groups: [group(file("a")), group(file("b")), group(file("c"))], keyBase: "p", uploader, concurrency: 2,
+    transform: {
+      ...rawTransform,
+      start: (item) => [{ stream: new ReadableStream({
+        cancel: () => item.keys[0] === "p/a" ? cleanup : undefined,
+      }) }],
+    },
+  });
+  const result = run.catch((err) => err);
+  await tick();
+  fail(Object.assign(new Error("Link refused"), { kind: "link" }));
+  await tick();
+  assert.ok(signals[1].aborted, "a sibling must not keep uploading during cleanup");
+  assert.deepEqual(started, ["p/a", "p/b"]);
+  finishCleanup();
+  assert.equal((await result).groupIndex, 0);
 });

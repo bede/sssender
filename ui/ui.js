@@ -146,7 +146,7 @@ function readAllEntries(reader) {
   });
 }
 
-// One line for a selectFiles() result: "12 files selected (3.4GB total), …".
+// One line for a selectFiles() result: "12 files selected (3.4GB), …".
 // noun is "file" or "sequence file". details(sel) adds counts, e.g. ["2 pairs"]
 export function summariseSelection(sel, { noun = "file", details = () => [] } = {}) {
   const skipped = [
@@ -158,7 +158,7 @@ export function summariseSelection(sel, { noun = "file", details = () => [] } = 
     return [none, ...skipped].filter(Boolean).join(", ");
   }
   if (sel.error) return "Grouping error";
-  const total = `${humanBytes(sel.totalBytes)} total`;
+  const total = humanBytes(sel.totalBytes);
   const head = `${plural(sel.selected.length, noun)} selected (${[...details(sel), total].join(", ")})`;
   return [head, ...skipped].join(", ");
 }
@@ -192,17 +192,59 @@ export function bindCredentialForm({ server, bucket, accessKey, secretKey, onInp
   };
 }
 
+// --- Staying awake ---------------------------------------------------------------
+// While a run is going: a screen wake lock, so an idle machine doesn't sleep and drop
+// the connections (a closed lid still does), and a warning before the page is closed.
+// The browser drops the lock while the page is hidden, so it is retaken on return
+export function holdAwake({ doc = globalThis.document, nav = globalThis.navigator, win = globalThis } = {}) {
+  let held = true;
+  let lock = null;
+  const holding = () => lock && !lock.released;
+  const request = async () => {
+    if (!held || holding() || !nav?.wakeLock || doc?.visibilityState !== "visible") return;
+    try {
+      const next = await nav.wakeLock.request("screen");
+      // A visibility change may have started another request while this one waited
+      if (!held || holding()) {
+        await next.release().catch(() => {});
+        return;
+      }
+      lock = next;
+    } catch (_) {
+      // Refused (no secure context, battery saver…): uploads carry on regardless
+    }
+  };
+  const onBeforeUnload = (e) => {
+    e.preventDefault();
+    e.returnValue = ""; // older browsers
+  };
+  doc?.addEventListener?.("visibilitychange", request);
+  win?.addEventListener?.("beforeunload", onBeforeUnload);
+  request();
+  return () => {
+    held = false;
+    doc?.removeEventListener?.("visibilitychange", request);
+    win?.removeEventListener?.("beforeunload", onBeforeUnload);
+    lock?.release().catch(() => {});
+    lock = null;
+  };
+}
+
 // --- Busy indicator ----------------------------------------------------------
 // <html data-busy> while a run is going (pages animate as they like), and the
 // percentage in the tab title. finish() leaves "100% · title" until stop(), so a
-// background tab shows it's done. stop() restores the title.
+// background tab shows it's done. stop() restores the title. Holds the page awake
+// (holdAwake) from start() to finish() or stop().
 export function makeBusyIndicator({ progress }) {
   const pageTitle = document.title;
   const root = document.documentElement;
   let timer = null;
+  let release = null;
   const halt = () => {
     clearInterval(timer);
     timer = null;
+    release?.();
+    release = null;
   };
   const showPct = () => {
     const pct = Math.min(Math.floor(progress.value || 0), 100);
@@ -214,10 +256,12 @@ export function makeBusyIndicator({ progress }) {
       halt();
       root.dataset.busy = "";
       progress.value = 0; // a previous run leaves it at 100
+      release = holdAwake();
       const tick = () => {
         if (showPct() >= 100) {
           delete root.dataset.busy;
-          halt();
+          clearInterval(timer);
+          timer = null;
         }
       };
       timer = setInterval(tick, 500);
@@ -234,6 +278,28 @@ export function makeBusyIndicator({ progress }) {
       document.title = pageTitle;
     },
   };
+}
+
+// --- Done dialog ---------------------------------------------------------------
+// The confirmation dialog's twin, shown when a run finishes. skipped: [{ label, reason }]
+export function showDoneDialog(dialog, { count, dest, skipped = [], skippedCount = "" }) {
+  const $in = (id) => dialog.querySelector(`#${id}`);
+  $in("done-title").textContent = skipped.length ? "Upload finished, with files skipped" : "Upload complete";
+  $in("done-count").textContent = count;
+  $in("done-dest").textContent = dest;
+  $in("done-skipped").hidden = !skipped.length;
+  $in("done-skipped-count").textContent = skippedCount;
+  $in("done-skipped-list").replaceChildren(
+    ...skipped.map(({ label, reason }) => {
+      const li = document.createElement("li");
+      const why = document.createElement("span");
+      why.className = "reason";
+      why.textContent = reason;
+      li.append(label, why);
+      return li;
+    })
+  );
+  dialog.showModal();
 }
 
 // --- Confirmation dialog -----------------------------------------------------

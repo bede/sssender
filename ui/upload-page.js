@@ -2,7 +2,7 @@
 // Cancel, and one upload run. Shared markup ids:
 //   mode       creds, mint-entry, usage-creds, usage-link, link-banner
 //   selection  dir-zone, dir-input, dir-summary, type-toggles
-//   run        progress-wrap, run-progress, run-label
+//   run        progress-wrap, run-progress, run-label, done-dialog (optional, see showDoneDialog)
 // Pages keep readiness, buttons and transform.
 import { humanBytes, plural } from "../core/format.js?v=20261026-111304";
 import { parseMagicLink } from "../core/link.js?v=20261026-111304";
@@ -11,7 +11,14 @@ import { selectFiles } from "../core/select.js?v=20261026-111304";
 import { makeLinkUploader } from "../core/uploaders.js?v=20261026-111304";
 import { makeRunView } from "./run-view.js?v=20261026-111304";
 import { renderTypeToggles } from "./types.js?v=20261026-111304";
-import { bindFilePicker, formatError, renderLinkBanner, renderLinkError, summariseSelection } from "./ui.js?v=20261026-111304";
+import {
+  bindFilePicker,
+  formatError,
+  renderLinkBanner,
+  renderLinkError,
+  showDoneDialog,
+  summariseSelection,
+} from "./ui.js?v=20261026-111304";
 
 const $ = (id) => document.getElementById(id);
 
@@ -134,7 +141,7 @@ export const describeFiles = (groups) => plural(groups.reduce((n, g) => n + g.fi
 //   view                             more makeRunView options
 //   runLabel                         "Uploading", "Filtering and uploading"
 //   describe(groups)                 "3 files", "1 pair and 2 files"
-//   finishText(done, skipped)        the run view's last line
+//   finishText(done, skipped)        the run view's last line, once the manifest is written
 //   onGroupDone(i, item, result)     e.g. to add up reads
 //   setStatus, setBusy, busyIndicator, cancel (bindCancel)
 export async function uploadSelection({
@@ -150,9 +157,10 @@ export async function uploadSelection({
   view: viewOptions = {},
   runLabel = "Uploading",
   describe = describeFiles,
-  finishText = (done, skipped) =>
-    `Uploaded ${humanBytes(done.reduce((n, g) => n + g.size, 0))} across ${describe(done)}` +
-    (skipped.length ? `; ${describe(skipped)} skipped.` : "."),
+  finishText = (done, skipped) => {
+    const sent = `${humanBytes(done.reduce((n, g) => n + g.size, 0))} across ${describe(done)}`;
+    return skipped.length ? `Uploaded ${sent}; ${describe(skipped)} skipped.` : `Successfully uploaded ${sent}.`;
+  },
   onGroupDone,
   setStatus,
   setBusy,
@@ -174,7 +182,7 @@ export async function uploadSelection({
     streaming: !link, // a credential upload streams a transform's output as it comes
     ...viewOptions,
   });
-  const skipped = [];
+  const reasons = new Map(); // skipped group -> why
   let started = false;
   try {
     const { failed } = await runUpload({
@@ -198,15 +206,19 @@ export async function uploadSelection({
         },
         onGroupFailed(i, item, err) {
           console.warn(`skipped ${item.label}:`, err);
-          skipped.push(groups[i]);
+          reasons.set(groups[i], String(err?.message || err || "unknown error"));
           view.onGroupFailed(i, item, err);
         },
+        // The run's last line waits for the manifest: until then it may yet fail
         onFinalising() {
-          view.finish(finishText(groups.filter((g) => !skipped.includes(g)), skipped));
+          view.finish("Finalising …");
           setStatus("Finalising (writing manifest) …");
         },
       },
     });
+    const skipped = [...reasons.keys()];
+    const done = groups.filter((g) => !reasons.has(g));
+    view.finish(finishText(done, skipped));
     if (failed.length) {
       setStatus(
         `Upload finished, but ${describe(skipped)} failed and ${skipped.length === 1 ? "was" : "were"} skipped ` +
@@ -214,6 +226,16 @@ export async function uploadSelection({
         "error"
       );
     } else setStatus(`Upload complete (${keyBase})`, "success");
+    const dialog = $("done-dialog");
+    if (dialog) {
+      const bucket = link ? link.bucket : creds.bucket?.();
+      showDoneDialog(dialog, {
+        count: `${describe(done)} (${humanBytes(done.reduce((n, g) => n + g.size, 0))})`,
+        dest: `${bucket ? `${bucket}/` : ""}${keyBase}/`,
+        skipped: skipped.map((g) => ({ label: g.label, reason: reasons.get(g) })),
+        skippedCount: describe(skipped),
+      });
+    }
     return true;
   } catch (err) {
     busyIndicator.stop();

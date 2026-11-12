@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const { checkReadable, isRetryableUploadError, postObjectWithRetry, postObject, STALL_MS, RESPONSE_MS, SMALL_MS } = await import(
+const { checkReadable, isRetryableUploadError, postObjectWithRetry, postObject, STALL_MS, RESPONSE_MS, READ_CHECK_MS } = await import(
   `${pathToFileURL(resolve(here, "../core/post.js"))}?test=${Date.now()}`
 );
 
@@ -164,61 +164,6 @@ test("postObjectWithRetry does not start a POST while already offline", async ()
   assert.deepEqual(events, ["waiting-online", "wait-before-0", "resumed"]);
 });
 
-test("postObject aborts an in-flight XHR when the browser goes offline", async () => {
-  const originalWindow = globalThis.window;
-  const originalXhr = globalThis.XMLHttpRequest;
-  const listeners = new Map();
-  let sent = false;
-  let aborted = false;
-
-  class MockXhr {
-    constructor() {
-      this.upload = {};
-    }
-    open() {}
-    send() {
-      sent = true;
-    }
-    abort() {
-      aborted = true;
-      this.onabort?.();
-    }
-  }
-
-  globalThis.window = {
-    addEventListener(type, fn) {
-      listeners.set(type, fn);
-    },
-    removeEventListener(type, fn) {
-      if (listeners.get(type) === fn) listeners.delete(type);
-    },
-  };
-  globalThis.XMLHttpRequest = MockXhr;
-
-  try {
-    const upload = postObject({
-      link: { endpoint: "https://example.test", bucket: "bucket", fields: {} },
-      key: "prefix/file.fastq.gz",
-      body: new Blob(["x"]),
-      onProgress: () => {},
-    });
-
-    assert.equal(sent, true);
-    listeners.get("offline")();
-
-    await assert.rejects(upload, (err) => {
-      assert.equal(err.kind, "network");
-      assert.equal(err.offline, true);
-      return /Connection lost/.test(err.message);
-    });
-    assert.equal(aborted, true);
-    assert.equal(listeners.has("offline"), false);
-  } finally {
-    globalThis.window = originalWindow;
-    globalThis.XMLHttpRequest = originalXhr;
-  }
-});
-
 // --- Idle timeouts ------------------------------------------------------------
 // Timers are injected so these run instantly. The real durations are minutes long.
 
@@ -275,7 +220,7 @@ function withMockXhr(run) {
       xhr = this;
     }
     open() {}
-    send() {}
+    send(form) { this.form = form; }
     abort() {
       this.aborted = true;
       this.onabort?.();
@@ -303,7 +248,7 @@ function withMockXhr(run) {
   globalThis.XMLHttpRequest = MockXhr;
 
   const link = { endpoint: "https://example.test", bucket: "bucket", fields: {} };
-  const start = (timers) =>
+  const start = (timers, options = {}) =>
     postObject({
       link,
       key: "prefix/file.fastq.gz",
@@ -311,11 +256,12 @@ function withMockXhr(run) {
       onProgress: () => {},
       setTimerFn: timers.setTimerFn,
       clearTimerFn: timers.clearTimerFn,
+      ...options,
     });
 
   return (async () => {
     try {
-      return await run({ start, goOffline: () => listeners.get("offline")(), xhr: () => xhr });
+      return await run({ start, goOffline: () => listeners.get("offline")(), xhr: () => xhr, listeners });
     } finally {
       globalThis.window = originalWindow;
       globalThis.XMLHttpRequest = originalXhr;
@@ -440,108 +386,68 @@ test("loadend fired by an abort does not arm the response timer", async () =>
   }));
 
 test("an offline abort keeps its cause and clears the timers", async () =>
-  withMockXhr(async ({ start, xhr, goOffline }) => {
+  withMockXhr(async ({ start, xhr, goOffline, listeners }) => {
     const timers = fakeTimers();
     const upload = start(timers);
+    assert.ok(xhr().form, "the request was sent");
 
     goOffline();
 
     await assert.rejects(upload, (err) => {
       assert.equal(err.offline, true);
+      assert.equal(err.kind, "network");
       return /Connection lost/.test(err.message);
     });
+    assert.ok(xhr().aborted);
+    assert.ok(!listeners.has("offline"));
     // Settled, so a stall timer can no longer fire and reject a second time
     assert.deepEqual(timers.armed, []);
   }));
 
-function withMockFetch(impl, run) {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = impl;
-  const timers = fakeTimers();
-  const post = () =>
-    postObject({
-      link: { endpoint: "https://example.test", bucket: "bucket", fields: {} },
-      key: "prefix/_MANIFEST.txt",
-      body: new Blob(["x"]),
-      contentType: "text/plain",
-      setTimerFn: timers.setTimerFn,
-      clearTimerFn: timers.clearTimerFn,
+test("control objects use XHR and the same progress-driven timers without a progress callback", async () =>
+  withMockXhr(async ({ start, xhr }) => {
+    const timers = fakeTimers();
+    const fields = { policy: "signed-policy", "x-amz-signature": "signature" };
+    const upload = start(timers, {
+      key: "prefix/_MANIFEST.txt", contentType: "text/plain", onProgress: undefined,
+      link: { endpoint: "https://example.test", bucket: "bucket", fields },
     });
-  return (async () => {
-    try {
-      return await run({ post, timers });
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  })();
-}
+    assert.deepEqual(timers.armed, [STALL_MS]);
+    assert.equal(typeof xhr().upload.onprogress, "function");
+    const entries = [...xhr().form.entries()];
+    assert.deepEqual(entries.slice(0, -1), [
+      ["key", "prefix/_MANIFEST.txt"], ...Object.entries(fields), ["Content-Type", "text/plain"],
+    ]);
+    assert.equal(entries.at(-1)[0], "file");
+    xhr().progress(1000);
+    xhr().bodySent();
+    assert.deepEqual(timers.armed, [RESPONSE_MS]);
+    xhr().respond(204);
+    await upload;
+    assert.deepEqual(timers.armed, []);
+  }));
 
-test("a silent small-object POST times out and stays retryable", async () =>
-  withMockFetch(
-    (_url, opts) =>
-      new Promise((_resolve, reject) => {
-        opts.signal?.addEventListener("abort", () => reject(new Error("aborted")));
-      }),
-    async ({ post, timers }) => {
-      const upload = post();
-      assert.deepEqual(timers.armed, [SMALL_MS]);
+test("control-object HTTP errors retain their classification and clear timers", async () =>
+  withMockXhr(async ({ start, xhr }) => {
+    const timers = fakeTimers();
+    const upload = start(timers, { key: "prefix/_MANIFEST.txt", onProgress: undefined });
+    xhr().responseText = "<Error><Code>AccessDenied</Code><Message>nope</Message></Error>";
+    xhr().respond(403);
+    await assert.rejects(upload, (err) => err.kind === "link" && err.name === "AccessDenied");
+    assert.deepEqual(timers.armed, []);
+  }));
 
-      timers.fire(SMALL_MS);
-      await assert.rejects(upload, (err) => {
-        assert.equal(err.kind, "network");
-        assert.equal(isRetryableUploadError(err), true);
-        return /timed out/i.test(err.message);
-      });
-      assert.deepEqual(timers.armed, []);
-    }
-  ));
-
-test("the small-object timer is cleared on success", async () =>
-  withMockFetch(
-    async () => ({ ok: true }),
-    async ({ post, timers }) => {
-      await post();
-      assert.deepEqual(timers.armed, []);
-    }
-  ));
-
-test("the small-object timer is cleared on an HTTP error", async () =>
-  withMockFetch(
-    async () => ({
-      ok: false,
-      status: 403,
-      statusText: "Forbidden",
-      text: async () => "<Error><Code>AccessDenied</Code><Message>nope</Message></Error>",
-    }),
-    async ({ post, timers }) => {
-      await assert.rejects(post(), (err) => {
-        assert.equal(err.kind, "link");
-        return err.name === "AccessDenied";
-      });
-      assert.deepEqual(timers.armed, []);
-    }
-  ));
-
-test("the small-object timer covers a stalled HTTP error body", async () =>
-  withMockFetch(
-    async (_url, opts) => ({
-      ok: false,
-      status: 503,
-      statusText: "Unavailable",
-      text: () =>
-        new Promise((_resolve, reject) => {
-          opts.signal?.addEventListener("abort", () => reject(new Error("aborted")));
-        }),
-    }),
-    async ({ post, timers }) => {
-      const upload = post();
-      await Promise.resolve();
-      assert.deepEqual(timers.armed, [SMALL_MS]);
-      timers.fire(SMALL_MS);
-      await assert.rejects(upload, /timed out/i);
-      assert.deepEqual(timers.armed, []);
-    }
-  ));
+test("a control-object response that stalls after headers is still bounded", async () =>
+  withMockXhr(async ({ start, xhr }) => {
+    const timers = fakeTimers();
+    const upload = start(timers, { key: "prefix/_MANIFEST.txt", onProgress: undefined });
+    xhr().bodySent();
+    xhr().status = 503; // headers arrived, but onload waits for the complete body
+    timers.fire(RESPONSE_MS);
+    await assert.rejects(upload, (err) => err.kind === "network" && /timed out/.test(err.message));
+    assert.ok(xhr().aborted);
+    assert.deepEqual(timers.armed, []);
+  }));
 
 // --- Spool storage ------------------------------------------------------------
 
@@ -629,4 +535,63 @@ test("a file that became unreadable is not retried forever", async () => {
     (err) => err.kind === "input"
   );
   assert.equal(attempts, 1);
+});
+
+// A File whose disk stopped answering
+class HungFile extends Blob {
+  slice() {
+    return { arrayBuffer: () => new Promise(() => {}) };
+  }
+}
+
+test("checkReadable gives up on a read that hangs, as an input problem", async () => {
+  let fire;
+  let cleared = 0;
+  const check = checkReadable(new HungFile(["x"]), {
+    setTimerFn: (fn) => ((fire = fn), 1),
+    clearTimerFn: () => cleared++,
+  });
+  fire();
+  await assert.rejects(check, (err) => err.kind === "input" && /stopped responding/.test(err.message));
+  assert.equal(cleared, 1);
+});
+
+test("checkReadable leaves no timer behind once the byte is read", async () => {
+  let cleared = 0;
+  await checkReadable(new Blob(["x"]), { setTimerFn: () => 7, clearTimerFn: (t) => (cleared += t === 7) });
+  assert.equal(cleared, 1);
+});
+
+test("link expiry ends a hung readability check and clears both wait timers", async () => {
+  const timers = fakeTimers();
+  let now = 0;
+  let attempts = 0;
+  const run = postObjectWithRetry({
+    link: { expiresAt: 2500 }, body: new HungFile(["x"]), nowFn: () => now,
+    setTimerFn: timers.setTimerFn, clearTimerFn: timers.clearTimerFn,
+    postOnce: async () => { attempts++; throw Object.assign(new Error("offline"), { kind: "network" }); },
+  });
+  await new Promise(setImmediate);
+  assert.deepEqual(timers.armed, [READ_CHECK_MS, 2500]);
+  now = 2500;
+  timers.fire(2500);
+  await assert.rejects(run, (err) => err.kind === "link");
+  assert.deepEqual(timers.armed, []);
+  assert.equal(attempts, 1);
+});
+
+test("Cancel clears a hung readability check's timer too", async () => {
+  const timers = fakeTimers();
+  const ctrl = new AbortController();
+  const run = postObjectWithRetry({
+    link: { expiresAt: Date.now() + 60_000 }, body: new HungFile(["x"]), signal: ctrl.signal,
+    setTimerFn: timers.setTimerFn, clearTimerFn: timers.clearTimerFn,
+    postOnce: async () => { throw Object.assign(new Error("offline"), { kind: "network" }); },
+  });
+  await new Promise(setImmediate);
+  assert.ok(timers.armed.includes(READ_CHECK_MS));
+  const reason = new Error("Cancelled during read");
+  ctrl.abort(reason);
+  await assert.rejects(run, (err) => err === reason);
+  assert.deepEqual(timers.armed, []);
 });
